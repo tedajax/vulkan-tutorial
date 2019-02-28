@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <functional>
 #include <iterator>
+#include <fstream>
 
 
 template <typename T>
@@ -32,6 +33,8 @@ static std::optional<uint32_t> get_index_if(std::vector<T> data, std::function<b
 
     return std::optional<uint32_t>();
 }
+
+static std::vector<char> read_file(const std::string& filename);
 
 struct QueueFamilyIndices
 {
@@ -55,8 +58,6 @@ void on_key_press(GLFWwindow* window, int key, int scancode, int mods, bool repe
 void on_key_release(GLFWwindow* window, int key, int scancode, int mods);
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageType, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData);
-
-void test_everything_works();
 
 int main()
 {
@@ -552,30 +553,22 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug(VkDebugUtilsMessageSeverityFlagBi
     return VK_FALSE;
 }
 
-void test_everything_works()
+static std::vector<char> read_file(const std::string& filename)
 {
-    glfwInit();
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
 
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    GLFWwindow* window = glfwCreateWindow(800, 600, "Vulkan window", nullptr, nullptr);
-
-    uint32_t extensionCount = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr);
-
-    printf("%d extensions supported\n", extensionCount);
-
-    glm::mat4 matrix;
-    glm::vec4 vec;
-    auto test = matrix * vec;
-
-
-    while (!glfwWindowShouldClose(window))
+    if (!file.is_open())
     {
-        glfwPollEvents();
+        throw std::runtime_error("Failed to open file.");
     }
 
-    glfwDestroyWindow(window);
+    size_t fileSize = static_cast<size_t>(file.tellg());
+    std::vector<char> buffer(fileSize);
 
-    glfwTerminate();
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
 
+    file.close();
+
+    return buffer;
 }
