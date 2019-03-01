@@ -52,19 +52,10 @@ struct SwapChainSupport
 
 SwapChainSupport query_swap_chain_support(VkPhysicalDevice device, VkSurfaceKHR surface);
 
-void on_key_event(GLFWwindow* window, int key, int scancode, int action, int mods);
-void on_key_press(GLFWwindow* window, int key, int scancode, int mods, bool repeat);
-void on_key_release(GLFWwindow* window, int key, int scancode, int mods);
-
 static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageType, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData);
 
 int main()
 {
-#if 0
-    test_everything_works();
-    return 0;
-#endif
-
     GLFWwindow* window = nullptr;
     const int SCREEN_WIDTH = 1280, SCREEN_HEIGHT = 720;
     
@@ -86,7 +77,14 @@ int main()
         glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
         window = glfwCreateWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "VulkanTutorial", nullptr, nullptr);
-        glfwSetKeyCallback(window, on_key_event);
+        glfwSetKeyCallback(window, [](GLFWwindow* window, int key, int scancode, int action, int mods)
+        {
+            switch (action)
+            {
+            case GLFW_PRESS: if (key == GLFW_KEY_ESCAPE) { glfwSetWindowShouldClose(window, GLFW_TRUE); } break;
+            default: break;
+            }
+        });
 
         uint32_t glfwExtensionCount = 0;
         const char** glfwExtensions;
@@ -118,7 +116,6 @@ int main()
         if (vkCreateInstance(&createInfo, nullptr, &vulkan) != VK_SUCCESS)
         {
             throw std::runtime_error("Failed to create Vulkan instance.");
-            return 1;
         }
     }
 
@@ -141,7 +138,6 @@ int main()
         else
         {
             throw std::runtime_error("Failed to find vkCreateDebugUtilsMessengerEXT");
-            return 1;
         }
     }
 
@@ -151,7 +147,6 @@ int main()
         if (glfwCreateWindowSurface(vulkan, window, nullptr, &surface) != VK_SUCCESS)
         {
             throw new std::runtime_error("Failed to create window surface.");
-            return 1;
         }
     }
 
@@ -168,7 +163,6 @@ int main()
         if (deviceCount == 0)
         {
             throw std::runtime_error("Failed to find a GPU with Vulkan support.");
-            return 1;
         }
 
         std::vector<VkPhysicalDevice> devices(deviceCount);
@@ -229,7 +223,6 @@ int main()
         if (physicalDevice == VK_NULL_HANDLE)
         {
             throw std::runtime_error("No devices were suitable.");
-            return 1;
         }
 
         // Create logical device
@@ -268,7 +261,6 @@ int main()
         if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) != VK_SUCCESS)
         {
             throw std::runtime_error("Failed to create logical device.");
-            return 1;
         }
 
         vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
@@ -385,7 +377,6 @@ int main()
         if (vkCreateSwapchainKHR(device, &createInfo, nullptr, &swapChain) != VK_SUCCESS)
         {
             throw std::runtime_error("Failed to create swap chain.");
-            return -1;
         }
 
         vkGetSwapchainImagesKHR(device, swapChain, &imageCount, nullptr);
@@ -452,12 +443,22 @@ int main()
         subpass.colorAttachmentCount = 1;
         subpass.pColorAttachments = &colorAttachmentRef;
 
+        VkSubpassDependency dependency = {};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcAccessMask = 0;
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
         VkRenderPassCreateInfo renderPassInfo = {};
         renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
         renderPassInfo.attachmentCount = 1;
         renderPassInfo.pAttachments = &colorAttachment;
         renderPassInfo.subpassCount = 1;
         renderPassInfo.pSubpasses = &subpass;
+        renderPassInfo.dependencyCount = 1;
+        renderPassInfo.pDependencies = &dependency;
 
         if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS)
         {
@@ -719,7 +720,7 @@ int main()
                 renderPassInfo.renderArea.offset = { 0, 0 };
                 renderPassInfo.renderArea.extent = swapChainExtent;
 
-                VkClearValue clearColor = { 0.0f, 0.0f, 0.0f, 1.0f };
+                VkClearValue clearColor = { 0.1f, 0.1f, 0.1f, 1.0f };
                 renderPassInfo.clearValueCount = 1;
                 renderPassInfo.pClearValues = &clearColor;
 
@@ -740,13 +741,70 @@ int main()
         });
     }
 
+    VkSemaphore imageAvailableSemaphore;
+    VkSemaphore renderFinishedSemaphore;
+    {
+        VkSemaphoreCreateInfo semaphoreInfo = {};
+        semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphore) != VK_SUCCESS ||
+            vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphore) != VK_SUCCESS)
+        {
+            throw std::runtime_error("Failed to create semaphores.");
+        }
+    }
+
     // main loop
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
+
+        // draw frame
+        {
+            uint32_t imageIndex;
+            vkAcquireNextImageKHR(device, swapChain, -1, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+
+            VkSubmitInfo submitInfo = {};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+            VkSemaphore waitSemaphores[] = { imageAvailableSemaphore };
+            VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+            submitInfo.waitSemaphoreCount = 1;
+            submitInfo.pWaitSemaphores = waitSemaphores;
+            submitInfo.pWaitDstStageMask = waitStages;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &commandBuffers[imageIndex];
+
+            VkSemaphore signalSemaphores[] = { renderFinishedSemaphore };
+            submitInfo.signalSemaphoreCount = 1;
+            submitInfo.pSignalSemaphores = signalSemaphores;
+
+            if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
+            {
+                throw std::runtime_error("Failed to submit draw command buffer.");
+            }
+
+            VkPresentInfoKHR presentInfo = {};
+            presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+            presentInfo.waitSemaphoreCount = 1;
+            presentInfo.pWaitSemaphores = signalSemaphores;
+
+            VkSwapchainKHR swapChains[] = { swapChain };
+            presentInfo.swapchainCount = 1;
+            presentInfo.pSwapchains = swapChains;
+            presentInfo.pImageIndices = &imageIndex;
+            presentInfo.pResults = nullptr;
+
+            vkQueuePresentKHR(presentQueue, &presentInfo);
+        }
     }
 
+    vkDeviceWaitIdle(device);
+
     // Cleanup
+    vkDestroySemaphore(device, imageAvailableSemaphore, nullptr);
+    vkDestroySemaphore(device, renderFinishedSemaphore, nullptr);
+
     vkDestroyCommandPool(device, commandPool, nullptr);
 
     for (auto frameBuffer : swapChainFramebuffers)
@@ -775,7 +833,6 @@ int main()
         else
         {
             throw std::runtime_error("Failed to find vkDestroyDebugUtilsMessengerEXT");
-            return 1;
         }
     }
 
@@ -836,29 +893,6 @@ SwapChainSupport query_swap_chain_support(VkPhysicalDevice device, VkSurfaceKHR 
     }
 
     return ret;
-}
-
-void on_key_event(GLFWwindow* window, int key, int scancode, int action, int mods)
-{
-    switch (action)
-    {
-    default:
-    case GLFW_PRESS: on_key_press(window, key, scancode, action, false); return;
-    case GLFW_REPEAT: on_key_press(window, key, scancode, action, true); return;
-    case GLFW_RELEASE: on_key_release(window, key, scancode, action); return;
-    }
-}
-void on_key_press(GLFWwindow* window, int key, int scancode, int mods, bool repeat)
-{
-    if (key == GLFW_KEY_ESCAPE)
-    {
-        glfwSetWindowShouldClose(window, GLFW_TRUE);
-    }
-}
-
-void on_key_release(GLFWwindow* window, int key, int scancode, int mods)
-{
-    // nothing
 }
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageType, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData)
