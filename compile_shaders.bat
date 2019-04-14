@@ -1,5 +1,5 @@
 @ECHO OFF
 SET AssetPath=%~dp0Assets
 
-glslangValidator -V %AssetPath%\Shaders\shader.vert -o %AssetPath%\Shaders\vert.spv
-glslangValidator -V %AssetPath%\Shaders\shader.frag -o %AssetPath%\Shaders\frag.spv
+glslangValidator -S vert -V %AssetPath%\Shaders\shader-vert.glsl -o %AssetPath%\Shaders\vert.spv
+glslangValidator -S frag -V %AssetPath%\Shaders\shader-frag.glsl -o %AssetPath%\Shaders\frag.spv
