@@ -6,6 +6,9 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
 #include <iostream>
 #include <cstdio>
 
@@ -101,6 +104,9 @@ struct VulkanContext
     // Descriptor pool/sets
     VkDescriptorPool descriptorPool;
     std::vector<VkDescriptorSet> descriptorSets;
+
+    VkImage textureImage;
+    VkDeviceMemory textureImageMemory;
 };
 
 SwapChainSupport query_swap_chain_support(VkPhysicalDevice device, VkSurfaceKHR surface);
@@ -110,6 +116,17 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug(VkDebugUtilsMessageSeverityFlagBi
 
 const uint32_t k_invalidMemoryType = static_cast<uint32_t>(-1);
 uint32_t find_memory_type(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties);
+void create_buffer(const VulkanContext& vk, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory);
+
+struct SingleUseVkCommandsBlock
+{
+    SingleUseVkCommandsBlock(const VulkanContext& vk);
+    ~SingleUseVkCommandsBlock();
+
+    VkCommandBuffer commandBuffer;
+    const VulkanContext& vk;
+};
+
 
 struct Vertex
 {
@@ -839,74 +856,164 @@ int main()
         }
     }
 
-    auto create_buffer = [](const VulkanContext& vk, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory)
+    auto transition_image_layout = [](const VulkanContext& vk, VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout)
     {
-        VkBufferCreateInfo bufferInfo = {};
-        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bufferInfo.size = size;
-        bufferInfo.usage = usage;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        if (vkCreateBuffer(vk.device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
+        auto layout_access_and_stage_flags = [](VkImageLayout layout, VkAccessFlags& accessFlagsOut, VkPipelineStageFlags& stageFlagsOut)
         {
-            throw std::runtime_error("Failed to create buffer.");
+            switch (layout)
+            {
+            default:
+            case VK_IMAGE_LAYOUT_UNDEFINED:
+                accessFlagsOut = 0;
+                stageFlagsOut = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+                break;
+
+            case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+                accessFlagsOut = VK_ACCESS_TRANSFER_WRITE_BIT;
+                stageFlagsOut = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                break;
+
+            case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+                accessFlagsOut = VK_ACCESS_SHADER_READ_BIT;
+                stageFlagsOut = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            }
+        };
+
+        SingleUseVkCommandsBlock commands(vk);
+        {
+            VkImageMemoryBarrier barrier = {};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.oldLayout = oldLayout;
+            barrier.newLayout = newLayout;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = image;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseMipLevel = 0;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.baseArrayLayer = 0;
+            barrier.subresourceRange.layerCount = 1;
+
+            VkPipelineStageFlags sourceStage;
+            VkPipelineStageFlags destinationStage;
+
+            layout_access_and_stage_flags(oldLayout, barrier.srcAccessMask, sourceStage);
+            layout_access_and_stage_flags(newLayout, barrier.dstAccessMask, destinationStage);
+
+            vkCmdPipelineBarrier(commands.commandBuffer,
+                sourceStage, destinationStage,
+                0,
+                0, nullptr,
+                0, nullptr,
+                1, &barrier);
+        }
+    };
+
+    auto copy_buffer_to_image = [](const VulkanContext& vk, VkBuffer buffer, VkImage image, uint32_t width, uint32_t height)
+    {
+        SingleUseVkCommandsBlock commands(vk);
+        {
+            VkBufferImageCopy region = {};
+            region.bufferOffset = 0;
+            region.bufferRowLength = 0;
+            region.bufferImageHeight = 0;
+
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.mipLevel = 0;
+            region.imageSubresource.baseArrayLayer = 0;
+            region.imageSubresource.layerCount = 1;
+
+            region.imageOffset = { 0, 0, 0 };
+            region.imageExtent = {
+                width, height, 1
+            };
+
+            vkCmdCopyBufferToImage(commands.commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        }
+    };
+
+    // Create texture image
+    {
+        // Load image file and copy pixel data to staging buffer
+        int textureWidth, textureHeight, textureChannels;
+        stbi_uc* pixels = stbi_load("../Assets/Textures/cloud_bro.png", &textureWidth, &textureHeight, &textureChannels, STBI_rgb_alpha);
+
+        VkDeviceSize imageSize = textureWidth * textureHeight * 4;
+
+        if (!pixels)
+        {
+            throw std::runtime_error("Failed to load texture image.");
         }
 
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(vk.device, buffer, &memRequirements);
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+
+        create_buffer(vk, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        void* data;
+        vkMapMemory(vk.device, stagingBufferMemory, 0, imageSize, 0, &data);
+        {
+            std::memcpy(data, pixels, static_cast<size_t>(imageSize));
+        }
+        vkUnmapMemory(vk.device, stagingBufferMemory);
+
+        stbi_image_free(pixels);
+
+        // 
+        VkImageCreateInfo imageInfo = {};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.extent.width = static_cast<uint32_t>(textureWidth);
+        imageInfo.extent.height = static_cast<uint32_t>(textureHeight);
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.flags = 0;
+
+        if (vkCreateImage(vk.device, &imageInfo, nullptr, &vk.textureImage) != VK_SUCCESS)
+        {
+            throw std::runtime_error("Failed to create image.");
+        }
+
+        VkMemoryRequirements memoryRequirements;
+        vkGetImageMemoryRequirements(vk.device, vk.textureImage, &memoryRequirements);
 
         VkMemoryAllocateInfo allocInfo = {};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = find_memory_type(vk.physicalDevice, memRequirements.memoryTypeBits, properties);
+        allocInfo.allocationSize = memoryRequirements.size;
+        allocInfo.memoryTypeIndex = find_memory_type(vk.physicalDevice, memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-        if (allocInfo.memoryTypeIndex == k_invalidMemoryType)
+        if (vkAllocateMemory(vk.device, &allocInfo, nullptr, &vk.textureImageMemory) != VK_SUCCESS)
         {
-            throw std::runtime_error("Failed to find appropriate memory type.");
+            throw std::runtime_error("Failed to allocate image memory.");
         }
 
-        if (vkAllocateMemory(vk.device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to allocate vertex buffer memory.");
-        }
+        vkBindImageMemory(vk.device, vk.textureImage, vk.textureImageMemory, 0);
 
-        vkBindBufferMemory(vk.device, buffer, bufferMemory, 0);
-    };
+        transition_image_layout(vk, vk.textureImage, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        copy_buffer_to_image(vk, stagingBuffer, vk.textureImage, static_cast<uint32_t>(textureWidth), static_cast<uint32_t>(textureHeight));
+        transition_image_layout(vk, vk.textureImage, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        vkDestroyBuffer(vk.device, stagingBuffer, nullptr);
+        vkFreeMemory(vk.device, stagingBufferMemory, nullptr);
+    }
 
     auto copy_buffer = [](const VulkanContext& vk, VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size)
     {
-        VkCommandBufferAllocateInfo allocInfo = {};
-        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandPool = vk.commandPool;
-        allocInfo.commandBufferCount = 1;
-
-        VkCommandBuffer commandBuffer;
-        vkAllocateCommandBuffers(vk.device, &allocInfo, &commandBuffer);
-
-        VkCommandBufferBeginInfo beginInfo = {};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+        SingleUseVkCommandsBlock commands(vk);
         {
             VkBufferCopy copyRegion = {};
             copyRegion.srcOffset = 0;
             copyRegion.dstOffset = 0;
             copyRegion.size = size;
-            vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+            vkCmdCopyBuffer(commands.commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
         }
-        vkEndCommandBuffer(commandBuffer);
-
-        VkSubmitInfo submitInfo = {};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffer;
-
-        vkQueueSubmit(vk.graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-        vkQueueWaitIdle(vk.graphicsQueue);
-
-        vkFreeCommandBuffers(vk.device, vk.commandPool, 1, &commandBuffer);
     };
 
     // Create vertex buffer
@@ -956,7 +1063,7 @@ int main()
     }
 
     // Create uniform buffers
-    auto create_uniform_buffers = [&create_buffer](VulkanContext& vk)
+    auto create_uniform_buffers = [](VulkanContext& vk)
     {
         VkDeviceSize bufferSize = sizeof(UniformBufferObject);
 
@@ -1270,6 +1377,9 @@ int main()
     // Cleanup
     cleanup_swap_chain(vk);
 
+    vkDestroyImage(vk.device, vk.textureImage, nullptr);
+    vkFreeMemory(vk.device, vk.textureImageMemory, nullptr);
+
     vkDestroyDescriptorSetLayout(vk.device, vk.descriptorSetLayout, nullptr);
 
     vkDestroyBuffer(vk.device, vk.vertexBuffer, nullptr);
@@ -1308,6 +1418,26 @@ int main()
     }
 
     return 0;
+}
+
+static std::vector<char> read_file(const std::string& filename)
+{
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+
+    if (!file.is_open())
+    {
+        throw std::runtime_error("Failed to open file.");
+    }
+
+    size_t fileSize = static_cast<size_t>(file.tellg());
+    std::vector<char> buffer(fileSize);
+
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
+
+    file.close();
+
+    return buffer;
 }
 
 QueueFamilyIndices get_queue_families(VkPhysicalDevice device, VkSurfaceKHR surface)
@@ -1384,22 +1514,69 @@ uint32_t find_memory_type(VkPhysicalDevice physicalDevice, uint32_t typeFilter, 
     return k_invalidMemoryType;
 }
 
-static std::vector<char> read_file(const std::string& filename)
+void create_buffer(const VulkanContext& vk, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory)
 {
-    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+    VkBufferCreateInfo bufferInfo = {};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    if (!file.is_open())
+    if (vkCreateBuffer(vk.device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
     {
-        throw std::runtime_error("Failed to open file.");
+        throw std::runtime_error("Failed to create buffer.");
     }
 
-    size_t fileSize = static_cast<size_t>(file.tellg());
-    std::vector<char> buffer(fileSize);
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(vk.device, buffer, &memRequirements);
 
-    file.seekg(0);
-    file.read(buffer.data(), fileSize);
+    VkMemoryAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = find_memory_type(vk.physicalDevice, memRequirements.memoryTypeBits, properties);
 
-    file.close();
+    if (allocInfo.memoryTypeIndex == k_invalidMemoryType)
+    {
+        throw std::runtime_error("Failed to find appropriate memory type.");
+    }
 
-    return buffer;
+    if (vkAllocateMemory(vk.device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to allocate vertex buffer memory.");
+    }
+
+    vkBindBufferMemory(vk.device, buffer, bufferMemory, 0);
+};
+
+SingleUseVkCommandsBlock::SingleUseVkCommandsBlock(const VulkanContext& vk)
+    : vk(vk)
+{
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool = vk.commandPool;
+    allocInfo.commandBufferCount = 1;
+
+    vkAllocateCommandBuffers(vk.device, &allocInfo, &commandBuffer);
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+}
+
+SingleUseVkCommandsBlock::~SingleUseVkCommandsBlock()
+{
+    vkEndCommandBuffer(commandBuffer);
+
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+
+    vkQueueSubmit(vk.graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(vk.graphicsQueue);
+
+    vkFreeCommandBuffers(vk.device, vk.commandPool, 1, &commandBuffer);
 }
