@@ -221,8 +221,11 @@ int main()
     struct App
     {
         bool frameBufferResized = false;
-        VulkanContext* vk;
-        GLFWwindow* window;
+        VulkanContext* vk = nullptr;
+        GLFWwindow* window = nullptr;
+        std::unordered_map<int, std::function<void(App*)>> debugCommands = {
+            { GLFW_KEY_ESCAPE, [](App* app) { glfwSetWindowShouldClose(app->window, GLFW_TRUE); } }
+        };
     };
     App app;
 
@@ -235,16 +238,20 @@ int main()
 
         window = glfwCreateWindow(k_screenWidth, k_screenHeight, "VulkanTutorial", nullptr, nullptr);
         app.window = window;
+        glfwSetWindowUserPointer(window, &app);
 
         glfwSetKeyCallback(window, [](GLFWwindow* window, int key, int scancode, int action, int mods)
         {
-            switch (action)
+            App* app = reinterpret_cast<App*>(glfwGetWindowUserPointer(window));
+            if (app != nullptr)
             {
-            case GLFW_PRESS: if (key == GLFW_KEY_ESCAPE) { glfwSetWindowShouldClose(window, GLFW_TRUE); } break;
-            default: break;
+                auto search = app->debugCommands.find(key);
+                if (search != app->debugCommands.end())
+                {
+                    search->second(app);
+                }
             }
         });
-        glfwSetWindowUserPointer(window, &app);
         glfwSetFramebufferSizeCallback(window, [](GLFWwindow* window, int width, int height)
         { 
             auto app = reinterpret_cast<App*>(glfwGetWindowUserPointer(window));
