@@ -107,6 +107,8 @@ struct VulkanContext
 
     VkImage textureImage;
     VkDeviceMemory textureImageMemory;
+    VkImageView textureImageView;
+    VkSampler textureSampler;
 };
 
 SwapChainSupport query_swap_chain_support(VkPhysicalDevice device, VkSurfaceKHR surface);
@@ -117,11 +119,43 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug(VkDebugUtilsMessageSeverityFlagBi
 const uint32_t k_invalidMemoryType = static_cast<uint32_t>(-1);
 uint32_t find_memory_type(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties);
 void create_buffer(const VulkanContext& vk, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory);
+void copy_buffer(const VulkanContext& vk, VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
+VkImageView create_texture_image_view(const VulkanContext& vk, VkImage textureImage, VkFormat format);
 
-struct SingleUseVkCommandsBlock
+struct SubmitVkCommandBuffer
 {
-    SingleUseVkCommandsBlock(const VulkanContext& vk);
-    ~SingleUseVkCommandsBlock();
+    SubmitVkCommandBuffer(const VulkanContext& vk)
+        : vk(vk)
+    {
+        VkCommandBufferAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandPool = vk.commandPool;
+        allocInfo.commandBufferCount = 1;
+
+        vkAllocateCommandBuffers(vk.device, &allocInfo, &commandBuffer);
+
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+    }
+
+    ~SubmitVkCommandBuffer()
+    {
+        vkEndCommandBuffer(commandBuffer);
+
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        vkQueueSubmit(vk.graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(vk.graphicsQueue);
+
+        vkFreeCommandBuffers(vk.device, vk.commandPool, 1, &commandBuffer);
+    }
 
     VkCommandBuffer commandBuffer;
     const VulkanContext& vk;
@@ -172,7 +206,7 @@ struct UniformBufferObject
 int main()
 {
     GLFWwindow* window = nullptr;
-    const uint32_t k_screenWidth = 1280, k_screenHeight = 720;
+    const uint32_t k_screenWidth = 2560, k_screenHeight = 1440;
 
     std::vector<const char*> enabledExtensions;
 
@@ -350,7 +384,13 @@ int main()
 
             QueueFamilyIndices indices = get_queue_families(device, vk.surface);
 
-            bool isSuitable = deviceHasNecessaryPropertiesAndFeatures && deviceHasNecessaryExtensions && deviceHasSufficientSwapChainSupport && indices.graphicsFamily.has_value() && indices.presentFamily.has_value();
+            bool isSuitable = deviceHasNecessaryPropertiesAndFeatures && 
+                deviceHasNecessaryExtensions && 
+                deviceHasSufficientSwapChainSupport && 
+                indices.graphicsFamily.has_value() && 
+                indices.presentFamily.has_value() &&
+                deviceFeatures.samplerAnisotropy;
+
             if (isSuitable)
             {
                 vk.physicalDevice = device;
@@ -384,6 +424,7 @@ int main()
         }
 
         VkPhysicalDeviceFeatures deviceFeatures = {};
+        deviceFeatures.samplerAnisotropy = VK_TRUE;
 
         VkDeviceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -542,28 +583,7 @@ int main()
         int index = 0;
         std::for_each(vk.swapChainImages.begin(), vk.swapChainImages.end(), [&](const auto& swapChainImage)
         {
-            VkImageViewCreateInfo createInfo = {};
-            createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            createInfo.image = swapChainImage;
-            createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            createInfo.format = vk.swapChainImageFormat;
-
-            createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-
-            createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            createInfo.subresourceRange.baseMipLevel = 0;
-            createInfo.subresourceRange.levelCount = 1;
-            createInfo.subresourceRange.baseArrayLayer = 0;
-            createInfo.subresourceRange.layerCount = 1;
-
-            if (vkCreateImageView(vk.device, &createInfo, nullptr, &vk.swapChainImageViews[index]) != VK_SUCCESS)
-            {
-                throw std::runtime_error("Failed to create image views.");
-            }
-
+            vk.swapChainImageViews[index] = create_texture_image_view(vk, swapChainImage, vk.swapChainImageFormat);
             ++index;
         });
     };
@@ -688,7 +708,7 @@ int main()
         auto attributeDescriptions = Vertex::get_attribute_descriptions();
 
         VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
-        vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
         vertexInputInfo.vertexBindingDescriptionCount = 1;
         vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
         vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());
@@ -879,7 +899,7 @@ int main()
             }
         };
 
-        SingleUseVkCommandsBlock commands(vk);
+        SubmitVkCommandBuffer commands(vk);
         {
             VkImageMemoryBarrier barrier = {};
             barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -911,7 +931,7 @@ int main()
 
     auto copy_buffer_to_image = [](const VulkanContext& vk, VkBuffer buffer, VkImage image, uint32_t width, uint32_t height)
     {
-        SingleUseVkCommandsBlock commands(vk);
+        SubmitVkCommandBuffer commands(vk);
         {
             VkBufferImageCopy region = {};
             region.bufferOffset = 0;
@@ -938,7 +958,7 @@ int main()
         int textureWidth, textureHeight, textureChannels;
         stbi_uc* pixels = stbi_load("../Assets/Textures/cloud_bro.png", &textureWidth, &textureHeight, &textureChannels, STBI_rgb_alpha);
 
-        VkDeviceSize imageSize = textureWidth * textureHeight * 4;
+        VkDeviceSize imageSize = static_cast<VkDeviceSize>(textureWidth) * textureHeight * 4;
 
         if (!pixels)
         {
@@ -1004,17 +1024,32 @@ int main()
         vkFreeMemory(vk.device, stagingBufferMemory, nullptr);
     }
 
-    auto copy_buffer = [](const VulkanContext& vk, VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size)
+    vk.textureImageView = create_texture_image_view(vk, vk.textureImage, VK_FORMAT_R8G8B8A8_UNORM);
+
+    // Create texture sampler
     {
-        SingleUseVkCommandsBlock commands(vk);
+        VkSamplerCreateInfo samplerInfo = {};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.anisotropyEnable = VK_TRUE;
+        samplerInfo.maxAnisotropy = 16;
+        samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+        samplerInfo.unnormalizedCoordinates = VK_FALSE;
+        samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.mipLodBias = 0.0f;
+        samplerInfo.minLod = 0.0f;
+        samplerInfo.maxLod = 0.0f;
+
+        if (vkCreateSampler(vk.device, &samplerInfo, nullptr, &vk.textureSampler) != VK_SUCCESS)
         {
-            VkBufferCopy copyRegion = {};
-            copyRegion.srcOffset = 0;
-            copyRegion.dstOffset = 0;
-            copyRegion.size = size;
-            vkCmdCopyBuffer(commands.commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+            throw std::runtime_error("Failed to create texture sampler.");
         }
-    };
+    }
 
     // Create vertex buffer
     {
@@ -1377,6 +1412,10 @@ int main()
     // Cleanup
     cleanup_swap_chain(vk);
 
+    vkDestroySampler(vk.device, vk.textureSampler, nullptr);
+
+    vkDestroyImageView(vk.device, vk.textureImageView, nullptr);
+
     vkDestroyImage(vk.device, vk.textureImage, nullptr);
     vkFreeMemory(vk.device, vk.textureImageMemory, nullptr);
 
@@ -1393,6 +1432,8 @@ int main()
     std::for_each(vk.inFlightFences.begin(), vk.inFlightFences.end(), [&](const auto& fence) { vkDestroyFence(vk.device, fence, nullptr); });
 
     vkDestroyCommandPool(vk.device, vk.commandPool, nullptr);
+
+    vkDestroySurfaceKHR(vk.vulkan, vk.surface, nullptr);
 
     vkDestroyDevice(vk.device, nullptr);
 
@@ -1548,35 +1589,40 @@ void create_buffer(const VulkanContext& vk, VkDeviceSize size, VkBufferUsageFlag
     vkBindBufferMemory(vk.device, buffer, bufferMemory, 0);
 };
 
-SingleUseVkCommandsBlock::SingleUseVkCommandsBlock(const VulkanContext& vk)
-    : vk(vk)
+void copy_buffer(const VulkanContext& vk, VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size)
 {
-    VkCommandBufferAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = vk.commandPool;
-    allocInfo.commandBufferCount = 1;
+    SubmitVkCommandBuffer commands(vk);
+    {
+        VkBufferCopy copyRegion = {};
+        copyRegion.srcOffset = 0;
+        copyRegion.dstOffset = 0;
+        copyRegion.size = size;
+        vkCmdCopyBuffer(commands.commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+    }
+};
 
-    vkAllocateCommandBuffers(vk.device, &allocInfo, &commandBuffer);
-
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    vkBeginCommandBuffer(commandBuffer, &beginInfo);
-}
-
-SingleUseVkCommandsBlock::~SingleUseVkCommandsBlock()
+VkImageView create_texture_image_view(const VulkanContext& vk, VkImage textureImage, VkFormat format)
 {
-    vkEndCommandBuffer(commandBuffer);
+    VkImageViewCreateInfo viewInfo = {};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = textureImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+    viewInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+    viewInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+    viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
 
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer;
+    VkImageView imageView;
+    if (vkCreateImageView(vk.device, &viewInfo, nullptr, &imageView) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to create image view.");
+    }
 
-    vkQueueSubmit(vk.graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(vk.graphicsQueue);
-
-    vkFreeCommandBuffers(vk.device, vk.commandPool, 1, &commandBuffer);
-}
+    return imageView;
+};
