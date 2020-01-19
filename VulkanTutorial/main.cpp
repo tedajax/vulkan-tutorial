@@ -6,8 +6,14 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/gtx/hash.hpp>
+
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+
+#define TINYOBJLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
 
 #include <iostream>
 #include <cstdio>
@@ -106,6 +112,7 @@ struct VulkanContext
     std::vector<VkDescriptorSet> descriptorSets;
 
     // A texture
+    uint32_t mipLevels;
     VkImage textureImage;
     VkDeviceMemory textureImageMemory;
     VkImageView textureImageView;
@@ -139,9 +146,9 @@ const uint32_t k_invalidMemoryType = static_cast<uint32_t>(-1);
 uint32_t find_memory_type(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties);
 void create_buffer(const VulkanContext& vk, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory);
 void copy_buffer(const VulkanContext& vk, VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
-void create_image(const VulkanContext& vk, uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory);
-VkImageView create_image_view(const VulkanContext& vk, VkImage image, VkFormat format, VkImageAspectFlags aspectFlags);
-void transition_image_layout(const VulkanContext& vk, VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout);
+void create_image(const VulkanContext& vk, uint32_t width, uint32_t height, uint32_t mipLevels, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory);
+VkImageView create_image_view(const VulkanContext& vk, VkImage image, VkFormat format, VkImageAspectFlags aspectFlags, uint32_t mipLevels);
+void transition_image_layout(const VulkanContext& vk, VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout, uint32_t mipLevels);
 
 struct SubmitVkCommandBuffer
 {
@@ -177,6 +184,8 @@ struct SubmitVkCommandBuffer
 
         vkFreeCommandBuffers(vk.device, vk.commandPool, 1, &commandBuffer);
     }
+
+    operator VkCommandBuffer() { return commandBuffer; }
 
     VkCommandBuffer commandBuffer;
     const VulkanContext& vk;
@@ -221,7 +230,27 @@ struct Vertex
 
         return attributeDescriptions;
     }
+
+    inline bool operator==(const Vertex& other) const
+    {
+        return position == other.position && color == other.color && texCoord == other.texCoord;
+    }
 };
+
+namespace std
+{
+    template<> struct hash<Vertex>
+    {
+        size_t operator()(Vertex const& vertex) const
+        {
+            auto a = hash<glm::vec3>()(vertex.position);
+            auto b = hash<glm::vec3>()(vertex.color);
+            auto c = hash<glm::vec2>()(vertex.texCoord);
+
+            return ((a ^ (b << 1)) >> 1) ^ (c << 1);
+        }
+    };
+}
 
 struct UniformBufferObject
 {
@@ -293,25 +322,25 @@ int main()
         enabledExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
 
-    const std::vector<Vertex> vertices = {
-        { {-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f} },
-        { {0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f} },
-        { {0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f} },
-        { {-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 0.0f}, {1.0f, 1.0f} },
+    //const std::vector<Vertex> vertices = {
+    //    { {-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f} },
+    //    { {0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f} },
+    //    { {0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f} },
+    //    { {-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 0.0f}, {1.0f, 1.0f} },
 
-        { {-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f} },
-        { {0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f} },
-        { {0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f} },
-        { {-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 0.0f}, {1.0f, 1.0f} },
-    };
+    //    { {-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f} },
+    //    { {0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f} },
+    //    { {0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f} },
+    //    { {-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 0.0f}, {1.0f, 1.0f} },
+    //};
 
-    const std::vector<uint16_t> indices = {
-        0, 1, 2,
-        2, 3, 0,
+    //const std::vector<uint16_t> indices = {
+    //    0, 1, 2,
+    //    2, 3, 0,
 
-        4, 5, 6,
-        6, 7, 4,
-    };
+    //    4, 5, 6,
+    //    6, 7, 4,
+    //};
 
     // Init Vulkan
     VulkanContext vk;
@@ -625,7 +654,7 @@ int main()
         int index = 0;
         std::for_each(vk.swapChainImages.begin(), vk.swapChainImages.end(), [&](const auto& swapChainImage)
         {
-            vk.swapChainImageViews[index] = create_image_view(vk, swapChainImage, vk.swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+            vk.swapChainImageViews[index] = create_image_view(vk, swapChainImage, vk.swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT, 1);
             ++index;
         });
     };
@@ -932,14 +961,15 @@ int main()
         create_image(vk,
             vk.swapChainExtent.width,
             vk.swapChainExtent.height,
+            1,
             depthFormat,
             VK_IMAGE_TILING_OPTIMAL,
             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             vk.depthImage,
             vk.depthImageMemory);
-        vk.depthImageView = create_image_view(vk, vk.depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
-        transition_image_layout(vk, vk.depthImage, depthFormat, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        vk.depthImageView = create_image_view(vk, vk.depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT, 1);
+        transition_image_layout(vk, vk.depthImage, depthFormat, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, 1);
     };
     create_depth_resources(vk);
 
@@ -975,8 +1005,6 @@ int main()
     };
     create_frame_buffers(vk);
 
-
-    
     auto copy_buffer_to_image = [](const VulkanContext& vk, VkBuffer buffer, VkImage image, uint32_t width, uint32_t height)
     {
         SubmitVkCommandBuffer commands(vk);
@@ -996,17 +1024,112 @@ int main()
                 width, height, 1
             };
 
-            vkCmdCopyBufferToImage(commands.commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            vkCmdCopyBufferToImage(commands, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         }
     };
 
-    
+    auto generate_mipmaps = [](const VulkanContext& vk, VkImage image, VkFormat imageFormat, int32_t textureWidth, int32_t textureHeight, uint32_t mipLevels)
+    {
+        VkFormatProperties formatProperties;
+        vkGetPhysicalDeviceFormatProperties(vk.physicalDevice, imageFormat, &formatProperties);
+
+        if (!(formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
+        {
+            throw std::runtime_error("Device does not support linear image filtering.");
+        }
+
+        SubmitVkCommandBuffer commands(vk);
+        {
+            VkImageMemoryBarrier barrier = {};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.image = image;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseArrayLayer = 0;
+            barrier.subresourceRange.layerCount = 1;
+            barrier.subresourceRange.levelCount = 1;
+
+            int32_t mipWidth = textureWidth;
+            int32_t mipHeight = textureHeight;
+
+            for (uint32_t i = 1; i < mipLevels; ++i)
+            {
+                barrier.subresourceRange.baseMipLevel = i - 1;
+                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+                vkCmdPipelineBarrier(commands,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                    0, nullptr,
+                    0, nullptr,
+                    1, &barrier);
+
+                VkImageBlit blit = {};
+                blit.srcOffsets[0] = { 0, 0, 0 };
+                blit.srcOffsets[1] = { mipWidth, mipHeight, 1 };
+                blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blit.srcSubresource.mipLevel = i - 1;
+                blit.srcSubresource.baseArrayLayer = 0;
+                blit.srcSubresource.layerCount = 1;
+                blit.dstOffsets[0] = { 0, 0, 0 };
+                blit.dstOffsets[1] = { (mipWidth > 1) ? mipWidth / 2 : 1, (mipHeight > 1) ? mipHeight / 2 : 1, 1 };
+                blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blit.dstSubresource.mipLevel = i;
+                blit.dstSubresource.baseArrayLayer = 0;
+                blit.dstSubresource.layerCount = 1;
+
+                vkCmdBlitImage(commands,
+                    image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    1, &blit,
+                    VK_FILTER_LINEAR);
+
+                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+                vkCmdPipelineBarrier(commands,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                    0, nullptr,
+                    0, nullptr,
+                    1, &barrier);
+
+                if (mipWidth > 1)
+                {
+                    mipWidth /= 2;
+                }
+
+                if (mipHeight > 1)
+                {
+                    mipHeight /= 2;
+                }
+            }
+
+            barrier.subresourceRange.baseMipLevel = mipLevels - 1;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            vkCmdPipelineBarrier(commands,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                0, nullptr,
+                0, nullptr,
+                1, &barrier);
+        }
+    };
 
     // Create texture image
     {
         // Load image file and copy pixel data to staging buffer
         int textureWidth, textureHeight, textureChannels;
-        stbi_uc* pixels = stbi_load("../Assets/Textures/cloud_bro.png", &textureWidth, &textureHeight, &textureChannels, STBI_rgb_alpha);
+        stbi_uc* pixels = stbi_load("../Assets/Textures/chalet.jpg", &textureWidth, &textureHeight, &textureChannels, STBI_rgb_alpha);
+
+        vk.mipLevels = static_cast<uint32_t>(std::floor(std::log2(std::max(textureWidth, textureHeight)))) + 1;
 
         VkDeviceSize imageSize = static_cast<VkDeviceSize>(textureWidth) * textureHeight * 4;
 
@@ -1032,21 +1155,40 @@ int main()
         create_image(vk,
             static_cast<uint32_t>(textureWidth),
             static_cast<uint32_t>(textureHeight),
+            vk.mipLevels,
             VK_FORMAT_R8G8B8A8_UNORM,
             VK_IMAGE_TILING_OPTIMAL,
-            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             vk.textureImage, vk.textureImageMemory);
 
-        transition_image_layout(vk, vk.textureImage, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        copy_buffer_to_image(vk, stagingBuffer, vk.textureImage, static_cast<uint32_t>(textureWidth), static_cast<uint32_t>(textureHeight));
-        transition_image_layout(vk, vk.textureImage, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        transition_image_layout(vk,
+            vk.textureImage,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            vk.mipLevels);
+        {
+            copy_buffer_to_image(vk,
+                stagingBuffer,
+                vk.textureImage,
+                static_cast<uint32_t>(textureWidth),
+                static_cast<uint32_t>(textureHeight));
+        }
+        generate_mipmaps(vk, vk.textureImage, VK_FORMAT_R8G8B8A8_UNORM, textureWidth, textureHeight, vk.mipLevels);
+        
+        //transition_image_layout(vk,
+        //    vk.textureImage,
+        //    VK_FORMAT_R8G8B8A8_UNORM,
+        //    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        //    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        //    vk.mipLevels);
 
         vkDestroyBuffer(vk.device, stagingBuffer, nullptr);
         vkFreeMemory(vk.device, stagingBufferMemory, nullptr);
+    
+        vk.textureImageView = create_image_view(vk, vk.textureImage, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, vk.mipLevels);
     }
-
-    vk.textureImageView = create_image_view(vk, vk.textureImage, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
 
     // Create texture sampler
     {
@@ -1065,11 +1207,58 @@ int main()
         samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
         samplerInfo.mipLodBias = 0.0f;
         samplerInfo.minLod = 0.0f;
-        samplerInfo.maxLod = 0.0f;
+        samplerInfo.maxLod = static_cast<float>(vk.mipLevels);
 
         if (vkCreateSampler(vk.device, &samplerInfo, nullptr, &vk.textureSampler) != VK_SUCCESS)
         {
             throw std::runtime_error("Failed to create texture sampler.");
+        }
+    }
+
+    // Load model
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    {
+        tinyobj::attrib_t attrib;
+        std::vector<tinyobj::shape_t> shapes;
+        std::vector<tinyobj::material_t> materials;
+        std::string warn, err;
+
+        if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, "../Assets/Models/chalet.obj"))
+        {
+            throw std::runtime_error("Failed to load model.");
+        }
+
+        std::unordered_map<Vertex, uint32_t> uniqueVertices = {};
+
+        for (const auto& shape : shapes)
+        {
+            for (const auto& index : shape.mesh.indices)
+            {
+                Vertex vertex = {};
+
+                vertex.position = {
+                    attrib.vertices[3 * index.vertex_index + 0],
+                    attrib.vertices[3 * index.vertex_index + 1],
+                    attrib.vertices[3 * index.vertex_index + 2],
+                };
+
+                vertex.texCoord = {
+                    attrib.texcoords[2 * index.texcoord_index + 0],
+                    1.0f - attrib.texcoords[2 * index.texcoord_index + 1],
+                };
+
+                vertex.color = { 1.0f, 1.0f, 1.0f };
+
+                if (uniqueVertices.count(vertex) == 0)
+                {
+                    uniqueVertices[vertex] = static_cast<uint32_t>(vertices.size());
+                    vertices.push_back(vertex);
+                }
+
+                vertices.push_back(vertex);
+                indices.push_back(uniqueVertices[vertex]);
+            }
         }
     }
 
@@ -1265,7 +1454,7 @@ int main()
                     VkDeviceSize offsets[] = { 0 };
                     vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
 
-                    vkCmdBindIndexBuffer(commandBuffer, vk.indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+                    vkCmdBindIndexBuffer(commandBuffer, vk.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
 
                     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.pipelineLayout, 0, 1, &vk.descriptorSets[index], 0, nullptr);
                     vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
@@ -1677,11 +1866,11 @@ void copy_buffer(const VulkanContext& vk, VkBuffer srcBuffer, VkBuffer dstBuffer
         copyRegion.srcOffset = 0;
         copyRegion.dstOffset = 0;
         copyRegion.size = size;
-        vkCmdCopyBuffer(commands.commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+        vkCmdCopyBuffer(commands, srcBuffer, dstBuffer, 1, &copyRegion);
     }
 };
 
-void create_image(const VulkanContext& vk, uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory)
+void create_image(const VulkanContext& vk, uint32_t width, uint32_t height, uint32_t mipLevels, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory)
 {
     VkImageCreateInfo imageInfo = {};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -1689,7 +1878,7 @@ void create_image(const VulkanContext& vk, uint32_t width, uint32_t height, VkFo
     imageInfo.extent.width = width;
     imageInfo.extent.height = height;
     imageInfo.extent.depth = 1;
-    imageInfo.mipLevels = 1;
+    imageInfo.mipLevels = mipLevels;
     imageInfo.arrayLayers = 1;
     imageInfo.format = format;
     imageInfo.tiling = tiling;
@@ -1720,7 +1909,7 @@ void create_image(const VulkanContext& vk, uint32_t width, uint32_t height, VkFo
     vkBindImageMemory(vk.device, image, imageMemory, 0);
 };
 
-VkImageView create_image_view(const VulkanContext& vk, VkImage image, VkFormat format, VkImageAspectFlags aspectFlags)
+VkImageView create_image_view(const VulkanContext& vk, VkImage image, VkFormat format, VkImageAspectFlags aspectFlags, uint32_t mipLevels)
 {
     VkImageViewCreateInfo viewInfo = {};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -1733,7 +1922,7 @@ VkImageView create_image_view(const VulkanContext& vk, VkImage image, VkFormat f
     viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
     viewInfo.subresourceRange.aspectMask = aspectFlags;
     viewInfo.subresourceRange.baseMipLevel = 0;
-    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.levelCount = mipLevels;
     viewInfo.subresourceRange.baseArrayLayer = 0;
     viewInfo.subresourceRange.layerCount = 1;
 
@@ -1746,7 +1935,7 @@ VkImageView create_image_view(const VulkanContext& vk, VkImage image, VkFormat f
     return imageView;
 };
 
-void transition_image_layout(const VulkanContext& vk, VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout)
+void transition_image_layout(const VulkanContext& vk, VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout, uint32_t mipLevels)
 {
     auto layout_access_and_stage_flags = [](VkImageLayout layout, VkAccessFlags& accessFlagsOut, VkPipelineStageFlags& stageFlagsOut)
     {
@@ -1786,7 +1975,7 @@ void transition_image_layout(const VulkanContext& vk, VkImage image, VkFormat fo
         barrier.image = image;
         barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         barrier.subresourceRange.baseMipLevel = 0;
-        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.levelCount = mipLevels;
         barrier.subresourceRange.baseArrayLayer = 0;
         barrier.subresourceRange.layerCount = 1;
 
@@ -1806,7 +1995,7 @@ void transition_image_layout(const VulkanContext& vk, VkImage image, VkFormat fo
         layout_access_and_stage_flags(oldLayout, barrier.srcAccessMask, sourceStage);
         layout_access_and_stage_flags(newLayout, barrier.dstAccessMask, destinationStage);
 
-        vkCmdPipelineBarrier(commands.commandBuffer,
+        vkCmdPipelineBarrier(commands,
             sourceStage, destinationStage,
             0,
             0, nullptr,
